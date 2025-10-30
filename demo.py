@@ -1,9 +1,20 @@
 from pathlib import Path
 import torch
+if torch.cuda.is_available(): 
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available(): 
+    device = torch.device('mps')
+else: 
+    device = torch.device('cpu')
+
 import argparse
 import os
 import cv2
 import numpy as np
+
+from hmr2.utils.utils_detectron2 import DefaultPredictor_Lazy
+from detectron2 import model_zoo
+from detectron2.config import get_cfg
 
 from hmr2.configs import CACHE_DIR_4DHUMANS
 from hmr2.models import HMR2, download_models, load_hmr2, DEFAULT_CHECKPOINT
@@ -24,7 +35,7 @@ def main():
     parser.add_argument('--top_view', dest='top_view', action='store_true', default=False, help='If set, render top view also')
     parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=False, help='If set, render all people together also')
     parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
-    parser.add_argument('--detector', type=str, default='vitdet', choices=['vitdet', 'regnety'], help='Using regnety improves runtime')
+    parser.add_argument('--detector', type=str, default='regnety', choices=['vitdet', 'regnety'], help='Using regnety improves runtime')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
     parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
 
@@ -40,23 +51,11 @@ def main():
     model.eval()
 
     # Load detector
-    from hmr2.utils.utils_detectron2 import DefaultPredictor_Lazy
-    if args.detector == 'vitdet':
-        from detectron2.config import LazyConfig
-        import hmr2
-        cfg_path = Path(hmr2.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
-        detectron2_cfg = LazyConfig.load(str(cfg_path))
-        detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
-        for i in range(3):
-            detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
-        detector = DefaultPredictor_Lazy(detectron2_cfg)
-    elif args.detector == 'regnety':
-        from detectron2 import model_zoo
-        from detectron2.config import get_cfg
-        detectron2_cfg = model_zoo.get_config('new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py', trained=True)
-        detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
-        detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh   = 0.4
-        detector       = DefaultPredictor_Lazy(detectron2_cfg)
+    detectron2_cfg = model_zoo.get_config('new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py', trained=True)
+    detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
+    detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh   = 0.4
+    # detectron2_cfg.model.device = str(device)
+    detector       = DefaultPredictor_Lazy(detectron2_cfg, device)
 
     # Setup the renderer
     renderer = Renderer(model_cfg, faces=model.smpl.faces)
