@@ -1,170 +1,124 @@
-from pathlib import Path
+import argparse
+import cv2
+import json
+import numpy as np
+import os
+
 import torch
 if torch.cuda.is_available(): 
     device = torch.device('cuda')
-elif torch.backends.mps.is_available(): 
-    device = torch.device('mps')
+# elif torch.backends.mps.is_available(): 
+#     device = torch.device('mps')
 else: 
     device = torch.device('cpu')
 
-import argparse
-import os
-import cv2
-import numpy as np
+from pathlib import Path
 
-from hmr2.utils.utils_detectron2 import DefaultPredictor_Lazy
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
-
 from hmr2.configs import CACHE_DIR_4DHUMANS
+from hmr2.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hmr2.models import HMR2, download_models, load_hmr2, DEFAULT_CHECKPOINT
 from hmr2.utils import recursive_to
-from hmr2.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hmr2.utils.renderer import Renderer, cam_crop_to_full
+from hmr2.utils.utils_detectron2 import DefaultPredictor_Lazy
 
-LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
+LIGHT_BLUE = (0.65098039,  0.74117647,  0.85882353)
 
-def main():
-    import time
-    start = time.time()
-    parser = argparse.ArgumentParser(description='HMR2 demo code')
-    parser.add_argument('--checkpoint', type=str, default=DEFAULT_CHECKPOINT, help='Path to pretrained model checkpoint')
-    parser.add_argument('--img_folder', type=str, default='example_data/images', help='Folder with input images')
-    parser.add_argument('--out_folder', type=str, default='demo_out', help='Output folder to save rendered results')
-    parser.add_argument('--side_view', dest='side_view', action='store_true', default=False, help='If set, render side view also')
-    parser.add_argument('--top_view', dest='top_view', action='store_true', default=False, help='If set, render top view also')
-    parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=False, help='If set, render all people together also')
-    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
-    parser.add_argument('--detector', type=str, default='regnety', choices=['vitdet', 'regnety'], help='Using regnety improves runtime')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
-    parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
 
-    args = parser.parse_args()
-
+def main(args):
     # Download and load checkpoints
     download_models(CACHE_DIR_4DHUMANS)
-    model, model_cfg = load_hmr2(args.checkpoint)
-
+    model, model_cfg = load_hmr2(DEFAULT_CHECKPOINT)
     # Setup HMR2.0 model
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # move model to the selected device (prefer CUDA, then MPS, then CPU)
     model = model.to(device)
     model.eval()
-
     # Load detector
     detectron2_cfg = model_zoo.get_config('new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py', trained=True)
     detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
     detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh   = 0.4
-    # detectron2_cfg.model.device = str(device)
-    detector       = DefaultPredictor_Lazy(detectron2_cfg, device)
-
+    detector = DefaultPredictor_Lazy(detectron2_cfg)
     # Setup the renderer
     renderer = Renderer(model_cfg, faces=model.smpl.faces)
 
     # Make output directory if it does not exist
     os.makedirs(args.out_folder, exist_ok=True)
 
-    # Get all demo images that end with .jpg or .png
-    img_paths = [img for end in args.file_type for img in Path(args.img_folder).glob(end)]
+    cap = cv2.VideoCapture(args.video_path)
 
-    # Iterate over all images in folder
-    for img_path in img_paths:
-        img_cv2 = cv2.imread(str(img_path))
+    frame = 0
+    transl_list = []
+    global_orient_list = []
+    body_pose_list = []
+    betas_list = []
+    focal_length_list = []
+    while cap.isOpened():
+        print("Current Frame: ", frame)
+        ret, img_cv2 = cap.read()
+        if ret:
+            # Detect humans in image
+            det_out = detector(img_cv2)
 
-        # Detect humans in image
-        det_out = detector(img_cv2)
+            det_instances = det_out['instances']
+            valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
+            boxes=det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
 
-        det_instances = det_out['instances']
-        valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
-        boxes=det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
+            # Run HMR2.0 on all detected humans
+            dataset = ViTDetDataset(model_cfg, img_cv2, boxes)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
 
-        # Run HMR2.0 on all detected humans
-        dataset = ViTDetDataset(model_cfg, img_cv2, boxes)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
+            for batch in dataloader:
+                batch = recursive_to(batch, device)
+                with torch.no_grad():
+                    out = model(batch)
 
-        all_verts = []
-        all_cam_t = []
-        
-        for batch in dataloader:
-            batch = recursive_to(batch, device)
-            with torch.no_grad():
-                out = model(batch)
+                pred_cam = out['pred_cam']
+                box_center = batch["box_center"].float()
+                box_size = batch["box_size"].float()
+                img_size = batch["img_size"].float()
+                scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+                pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length).detach().cpu().numpy()
 
-            pred_cam = out['pred_cam']
-            box_center = batch["box_center"].float()
-            box_size = batch["box_size"].float()
-            img_size = batch["img_size"].float()
-            scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-            pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length).detach().cpu().numpy()
+                batch_size = batch['img'].shape[0]
+                for n in range(batch_size):
+                    person_id = int(batch['personid'][n])
+                    input_patch = batch['img'][n].cpu() * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
+                    input_patch = input_patch.permute(1,2,0).numpy()
 
-            # Render the result
-            batch_size = batch['img'].shape[0]
-            for n in range(batch_size):
-                # Get filename from path img_path
-                img_fn, _ = os.path.splitext(os.path.basename(img_path))
-                person_id = int(batch['personid'][n])
-                white_img = (torch.ones_like(batch['img'][n]).cpu() - DEFAULT_MEAN[:,None,None]/255) / (DEFAULT_STD[:,None,None]/255)
-                input_patch = batch['img'][n].cpu() * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
-                input_patch = input_patch.permute(1,2,0).numpy()
+                    if isinstance(out['pred_smpl_params'], dict): 
+                        person_smpl = { 
+                            key: value[n].detach().cpu().numpy().tolist() 
+                            for key, value in out['pred_smpl_params'].items() 
+                        } 
+                    else: 
+                        person_smpl = out['pred_smpl_params'][n].detach().cpu().numpy().tolist()
+                    
+                    transl_list.append(pred_cam_t_full.tolist())
+                    global_orient_list.append(person_smpl['global_orient'])
+                    body_pose_list.append(person_smpl['body_pose'])
+                    betas_list.append(person_smpl['betas'])
+                    focal_length_list.append(float(scaled_focal_length))
 
-                regression_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
-                                        out['pred_cam_t'][n].detach().cpu().numpy(),
-                                        batch['img'][n],
-                                        mesh_base_color=LIGHT_BLUE,
-                                        scene_bg_color=(1, 1, 1),
-                                        )
+        frame += 1
+    
+    output = {
+        'transl': transl_list, 
+        'global_orient': global_orient_list, 
+        'body_pose': body_pose_list, 
+        'betas': betas_list, 
+        'focal_length': focal_length_list
+    }
+    json_path = os.path.join(args.out_folder, f'output.json')
+    with open(json_path, 'w') as f:
+        json.dump(output, f, indent=2)
 
-                final_img = np.concatenate([input_patch, regression_img], axis=1)
-
-                if args.side_view:
-                    side_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
-                                            out['pred_cam_t'][n].detach().cpu().numpy(),
-                                            white_img,
-                                            mesh_base_color=LIGHT_BLUE,
-                                            scene_bg_color=(1, 1, 1),
-                                            side_view=True)
-                    final_img = np.concatenate([final_img, side_img], axis=1)
-
-                if args.top_view:
-                    top_img = renderer(out['pred_vertices'][n].detach().cpu().numpy(),
-                                            out['pred_cam_t'][n].detach().cpu().numpy(),
-                                            white_img,
-                                            mesh_base_color=LIGHT_BLUE,
-                                            scene_bg_color=(1, 1, 1),
-                                            top_view=True)
-                    final_img = np.concatenate([final_img, top_img], axis=1)
-
-                cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_{person_id}.png'), 255*final_img[:, :, ::-1])
-
-                # Add all verts and cams to list
-                verts = out['pred_vertices'][n].detach().cpu().numpy()
-                cam_t = pred_cam_t_full[n]
-                all_verts.append(verts)
-                all_cam_t.append(cam_t)
-
-                # Save all meshes to disk
-                if args.save_mesh:
-                    camera_translation = cam_t.copy()
-                    tmesh = renderer.vertices_to_trimesh(verts, camera_translation, LIGHT_BLUE)
-                    tmesh.export(os.path.join(args.out_folder, f'{img_fn}_{person_id}.obj'))
-
-        # Render front view
-        if args.full_frame and len(all_verts) > 0:
-            misc_args = dict(
-                mesh_base_color=LIGHT_BLUE,
-                scene_bg_color=(1, 1, 1),
-                focal_length=scaled_focal_length,
-            )
-            cam_view = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size[n], **misc_args)
-
-            # Overlay image
-            input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
-            input_img = np.concatenate([input_img, np.ones_like(input_img[:,:,:1])], axis=2) # Add alpha channel
-            input_img_overlay = input_img[:,:,:3] * (1-cam_view[:,:,3:]) + cam_view[:,:,:3] * cam_view[:,:,3:]
-
-            cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.png'), 255*input_img_overlay[:, :, ::-1])
-
-        end = time.time()
-        print(end - start)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='HMR2 demo code')
+    parser.add_argument('--video_path', type=str, default='example_data/images', help='Folder with input images')
+    parser.add_argument('--out_folder', type=str, default='demo_out', help='Output folder to save rendered results')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
+    args = parser.parse_args()
+
+    main(args)
